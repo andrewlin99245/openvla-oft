@@ -457,6 +457,7 @@ def make_interleaved_dataset(
     *,
     train: bool,
     shuffle_buffer_size: int,
+    task_instruction_filter: Optional[str] = None,
     traj_transform_kwargs: Optional[Dict] = None,
     frame_transform_kwargs: Optional[Dict] = None,
     batch_size: Optional[int] = None,
@@ -563,6 +564,14 @@ def make_interleaved_dataset(
     # Validation =>> fix a single shuffle buffer of data and cache it in RAM; prevents gradual memory increase!
     if not train:
         dataset = dataset.take(shuffle_buffer_size).cache()
+
+    # Filter by task instruction before frame transforms so we do not pay the
+    # image decode/resize cost for non-matching samples.
+    if task_instruction_filter is not None:
+        target_instruction = task_instruction_filter.strip().lower()
+        dataset = dataset.filter(
+            lambda x: tf.equal(tf.strings.lower(x["task"]["language_instruction"]), target_instruction)
+        )
 
     # Shuffle the Dataset
     #   =>> IMPORTANT :: Shuffle AFTER .cache(), or else memory will still leak!

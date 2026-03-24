@@ -106,6 +106,10 @@ class PaddedCollatorForActionPrediction:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        if "task_instruction" in instances[0]:
+            task_instructions = [instance["task_instruction"] for instance in instances]
+        else:
+            task_instructions = None
 
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -153,4 +157,6 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if task_instructions is not None:
+            output["task_instructions"] = task_instructions
         return output

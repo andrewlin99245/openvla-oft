@@ -36,7 +36,15 @@ from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 # Initialize important constants
 DATE = time.strftime("%Y_%m_%d")
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda:0")
+    DTYPE = torch.bfloat16
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    DTYPE = torch.float16
+else:
+    DEVICE = torch.device("cpu")
+    DTYPE = torch.bfloat16
 OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
 
 # Configure NumPy print settings
@@ -237,7 +245,9 @@ def load_component_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     Returns:
         Dict: The processed state dictionary for loading
     """
-    state_dict = torch.load(checkpoint_path, weights_only=True)
+    # Load component weights onto CPU first so checkpoints saved from CUDA
+    # can still be restored on CPU-only or MPS machines.
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
 
     # If the component was trained with DDP, elements in the state dict have prefix "module." which we must remove
     new_state_dict = {}
@@ -282,7 +292,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
         # attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
+        torch_dtype=DTYPE,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
         low_cpu_mem_usage=True,
@@ -339,12 +349,12 @@ def _apply_film_to_vla(vla: torch.nn.Module, cfg: Any) -> torch.nn.Module:
 
     # Load vision backbone checkpoint
     checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vision_backbone")
-    state_dict = torch.load(checkpoint_path, weights_only=True)
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     vla.model.vision_backbone.load_state_dict(state_dict)
 
-    # Use the model component instead of wrapper and convert to bfloat16
+    # Use the model component instead of wrapper and convert to DTYPE
     vla = vla.model
-    vla.vision_backbone = vla.vision_backbone.to(torch.bfloat16)
+    vla.vision_backbone = vla.vision_backbone.to(DTYPE)
 
     return vla
 
@@ -407,7 +417,7 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
         llm_dim=llm_dim,
         proprio_dim=proprio_dim,
     ).to(DEVICE)
-    proprio_projector = proprio_projector.to(torch.bfloat16).to(DEVICE)
+    proprio_projector = proprio_projector.to(DTYPE).to(DEVICE)
     proprio_projector.eval()
 
     # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
@@ -450,7 +460,7 @@ def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     noisy_action_projector = NoisyActionProjector(
         llm_dim=llm_dim,
     ).to(DEVICE)
-    noisy_action_projector = noisy_action_projector.to(torch.bfloat16).to(DEVICE)
+    noisy_action_projector = noisy_action_projector.to(DTYPE).to(DEVICE)
     noisy_action_projector.eval()
 
     # Find and load checkpoint
@@ -489,7 +499,7 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     else:
         raise ValueError("Either use_l1_regression or use_diffusion must be True")
 
-    action_head = action_head.to(torch.bfloat16).to(DEVICE)
+    action_head = action_head.to(DTYPE).to(DEVICE)
     action_head.eval()
 
     # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
@@ -757,12 +767,12 @@ def get_vla_action(
         prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
 
         # Process primary image
-        inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
+        inputs = processor(prompt, primary_image).to(DEVICE, dtype=DTYPE)
 
         # Process additional wrist images if any
         if all_images:
             all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
+                processor(prompt, image_wrist).to(DEVICE, dtype=DTYPE) for image_wrist in all_images
             ]
             # Concatenate all images
             primary_pixel_values = inputs["pixel_values"]

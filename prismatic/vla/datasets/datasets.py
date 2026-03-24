@@ -7,7 +7,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 import numpy as np
 import torch
@@ -73,7 +73,14 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            actions=actions,
+            task_instruction=lang,
+        )
 
         # Add additional inputs
         if self.use_wrist_image:
@@ -101,6 +108,7 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        task_instruction_filter: Optional[str] = None,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -144,6 +152,7 @@ class RLDSDataset(IterableDataset):
             balance_weights=True,
             traj_transform_threads=len(mixture_spec),
             traj_read_threads=len(mixture_spec),
+            task_instruction_filter=task_instruction_filter,
             train=train,
         )
 

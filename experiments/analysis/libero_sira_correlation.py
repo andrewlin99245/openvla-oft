@@ -30,7 +30,15 @@ from prismatic.vla.datasets.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 
 
-DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda:0")
+    DTYPE = DTYPE
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    DTYPE = torch.float16
+else:
+    DEVICE = torch.device("cpu")
+    DTYPE = DTYPE
 
 
 class SIRAHook:
@@ -142,6 +150,7 @@ def build_dataloader(vla, processor, args: argparse.Namespace, dataset_name: str
         shuffle_buffer_size=1,
         train=True,
         image_aug=False,
+        task_instruction_filter=getattr(args, "task_instruction", None),
     )
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
@@ -231,7 +240,7 @@ def extract_predictive_hidden_from_layer(
         num_patches + num_prompt_tokens : num_patches + num_prompt_tokens + ACTION_DIM * NUM_ACTIONS_CHUNK,
         :,
     ]
-    return actions_hidden_states.to(torch.bfloat16)
+    return actions_hidden_states.to(DTYPE)
 
 
 def collect_losses_and_hiddens(
@@ -264,12 +273,12 @@ def collect_losses_and_hiddens(
 
             proprio = None
             if cfg.use_proprio and batch.get("proprio") is not None:
-                proprio = batch["proprio"].to(torch.bfloat16)
+                proprio = batch["proprio"].to(DTYPE)
 
             predicted_actions_raw, _ = vla.predict_action(
                 input_ids=prompt_input_ids.to(DEVICE),
                 attention_mask=prompt_attention_mask.to(DEVICE),
-                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(DEVICE),
+                pixel_values=batch["pixel_values"].to(DTYPE).to(DEVICE),
                 proprio=proprio,
                 proprio_projector=proprio_projector,
                 action_head=action_head,
