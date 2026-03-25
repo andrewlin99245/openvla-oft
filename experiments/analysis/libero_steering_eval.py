@@ -14,6 +14,7 @@ from tqdm import tqdm
 from experiments.analysis.libero_sira_correlation import (
     ACTION_DIM,
     DEVICE,
+    DTYPE,
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
     adapt_batch_normalization,
@@ -144,12 +145,12 @@ def predict_loss(
     prompt_input_ids, prompt_attention_mask = build_prompt_only_inputs(batch)
     proprio = None
     if cfg.use_proprio and batch.get("proprio") is not None:
-        proprio = batch["proprio"].to(torch.bfloat16)
+        proprio = batch["proprio"].to(DTYPE)
 
     predicted_actions_raw, _ = vla.predict_action(
         input_ids=prompt_input_ids.to(DEVICE),
         attention_mask=prompt_attention_mask.to(DEVICE),
-        pixel_values=batch["pixel_values"].to(torch.bfloat16).to(DEVICE),
+        pixel_values=batch["pixel_values"].to(DTYPE).to(DEVICE),
         proprio=proprio,
         proprio_projector=proprio_projector,
         action_head=action_head,
@@ -191,13 +192,13 @@ def compute_vectors(
 
             proprio = None
             if cfg.use_proprio and batch.get("proprio") is not None:
-                proprio = batch["proprio"].to(torch.bfloat16)
+                proprio = batch["proprio"].to(DTYPE)
 
             hooks.clear()
             predicted_actions_raw, _ = vla.predict_action(
                 input_ids=prompt_input_ids.to(DEVICE),
                 attention_mask=prompt_attention_mask.to(DEVICE),
-                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(DEVICE),
+                pixel_values=batch["pixel_values"].to(DTYPE).to(DEVICE),
                 proprio=proprio,
                 proprio_projector=proprio_projector,
                 action_head=action_head,
