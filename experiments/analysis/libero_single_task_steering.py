@@ -44,6 +44,8 @@ from experiments.robot.openvla_utils import get_action_head, get_processor, get_
 
 
 SUBSET_CACHE_VERSION = 1
+DEFAULT_VECTOR_TASK_INSTRUCTION = "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate"
+DEFAULT_EVAL_TASK_INSTRUCTION = "pick up the black bowl next to the cookie box and place it on the plate"
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,9 +57,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--task-instruction",
         default=None,
-        help="Filter to this exact task instruction (lowercase). If not set, the first instruction in the dataset is used.",
+        help="Shared fallback task instruction. If vector/eval task instructions are not provided, both use this value.",
     )
-    p.add_argument("--max-samples", type=int, default=1000)
+    p.add_argument(
+        "--vector-task-instruction",
+        default=DEFAULT_VECTOR_TASK_INSTRUCTION,
+        help="Task instruction used to build the cached subset and steering vector.",
+    )
+    p.add_argument(
+        "--eval-task-instruction",
+        default=DEFAULT_EVAL_TASK_INSTRUCTION,
+        help="Task instruction used for steered evaluation. If omitted, the script picks a different task by default.",
+    )
+    p.add_argument("--max-samples", type=int, default=400)
     p.add_argument(
         "--max-scan",
         type=int,
@@ -105,6 +117,13 @@ def canonicalize_instruction(instruction: Optional[str]) -> Optional[str]:
         return None
     normalized = instruction.strip().lower()
     return normalized or None
+
+
+def resolve_task_instructions(args: argparse.Namespace) -> tuple[Optional[str], Optional[str]]:
+    shared_task = canonicalize_instruction(args.task_instruction)
+    vector_task = canonicalize_instruction(args.vector_task_instruction) or shared_task
+    eval_task = canonicalize_instruction(args.eval_task_instruction) or shared_task or vector_task
+    return vector_task, eval_task
 
 
 def decode_instruction_from_input_ids(input_ids: torch.Tensor, tokenizer) -> str:
@@ -182,20 +201,32 @@ def cached_subset_matches(subset_dir: Path, args: argparse.Namespace, target_ins
     return samples_dir.exists()
 
 
-def discover_target_instruction(vla: nn.Module, processor, args: argparse.Namespace) -> str:
-    print("Discovering task instruction from the first dataset sample...")
+def discover_target_instruction(
+    vla: nn.Module,
+    processor,
+    args: argparse.Namespace,
+    *,
+    label: str = "task",
+    exclude_instruction: Optional[str] = None,
+) -> str:
+    print(f"Discovering {label} instruction from the dataset stream...")
     probe_args = clone_args(args, task_instruction=None)
     dataloader = build_dataloader(vla, processor, probe_args, args.dataset_name)
     tokenizer = processor.tokenizer
+    excluded = canonicalize_instruction(exclude_instruction)
 
     for idx, batch in enumerate(dataloader):
         if idx >= args.max_scan:
             break
         instruction = get_batch_instruction(batch, tokenizer)
-        if instruction:
+        if instruction and instruction != excluded:
             return instruction
 
-    raise RuntimeError(f"Could not discover a task instruction within the first {args.max_scan} streamed samples.")
+    if excluded is None:
+        raise RuntimeError(f"Could not discover a {label} instruction within the first {args.max_scan} streamed samples.")
+    raise RuntimeError(
+        f"Could not discover a {label} instruction different from '{excluded}' within the first {args.max_scan} streamed samples."
+    )
 
 
 def reset_subset_dir(subset_dir: Path) -> None:
@@ -210,19 +241,20 @@ def prepare_task_subset(
     processor,
     args: argparse.Namespace,
     output_dir: Path,
+    target_instruction: Optional[str] = None,
+    label: str = "task",
+    exclude_instruction: Optional[str] = None,
 ) -> dict:
-    target_instruction = canonicalize_instruction(args.task_instruction)
     if target_instruction is None:
-        target_instruction = discover_target_instruction(vla, processor, args)
-        print(f"  Auto-selected instruction: '{target_instruction}'")
+        target_instruction = discover_target_instruction(
+            vla, processor, args, label=label, exclude_instruction=exclude_instruction
+        )
+        print(f"  Auto-selected {label} instruction: '{target_instruction}'")
 
     subset_dir = get_subset_dir(output_dir, target_instruction)
     if not args.rebuild_subset and cached_subset_matches(subset_dir, args, target_instruction):
         metadata = load_subset_metadata(subset_dir)
-        print(
-            f"Reusing cached subset with {metadata['num_cached']} samples for "
-            f"'{metadata['task_instruction']}' from {subset_dir}"
-        )
+        print(f"Reusing cached {label} subset with {metadata['num_cached']} samples for '{metadata['task_instruction']}' from {subset_dir}")
         return metadata
 
     work_args = clone_args(args, task_instruction=target_instruction)
@@ -233,7 +265,7 @@ def prepare_task_subset(
     reset_subset_dir(subset_dir)
     samples_dir = get_subset_samples_dir(subset_dir)
 
-    print(f"Caching up to {args.max_samples} samples for task '{target_instruction}'...")
+    print(f"Caching up to {args.max_samples} samples for {label} task '{target_instruction}'...")
 
     collected = 0
     streamed = 0
@@ -260,7 +292,7 @@ def prepare_task_subset(
                 break
 
     if collected == 0:
-        raise RuntimeError(f"No samples found for task instruction '{target_instruction}'.")
+        raise RuntimeError(f"No samples found for {label} task instruction '{target_instruction}'.")
 
     metadata = {
         "cache_version": SUBSET_CACHE_VERSION,
@@ -530,6 +562,21 @@ def load_baseline_losses(output_dir: Path, num_samples: int) -> np.ndarray:
     return np.asarray(losses[:num_samples], dtype=np.float32)
 
 
+def try_load_collect_baseline(output_dir: Path, task_instruction: str, num_samples: int) -> Optional[np.ndarray]:
+    collect_metadata_path = output_dir / "collect" / "metadata.json"
+    if not collect_metadata_path.exists():
+        return None
+
+    with open(collect_metadata_path) as f:
+        metadata = json.load(f)
+
+    if metadata.get("task_instruction") != task_instruction:
+        return None
+    if int(metadata.get("num_collected", 0)) < num_samples:
+        return None
+    return load_baseline_losses(output_dir, num_samples)
+
+
 def steered_inference(
     vla: nn.Module,
     action_head: nn.Module,
@@ -538,6 +585,7 @@ def steered_inference(
     args: argparse.Namespace,
     output_dir: Path,
     subset_meta: dict,
+    vector_task_instruction: str,
 ) -> None:
     steer_dir = output_dir / "steered" / f"c{str(args.coeff).replace('.', 'p')}"
     steer_dir.mkdir(parents=True, exist_ok=True)
@@ -547,9 +595,10 @@ def steered_inference(
     layer_indices = list(range(len(llm_layers)))
     num_patches = compute_num_patches(vla, cfg)
     action_stats = subset_meta["action_stats"]
-    task_instruction = subset_meta["task_instruction"]
+    eval_task_instruction = subset_meta["task_instruction"]
     num_samples = min(int(subset_meta["num_cached"]), args.max_samples)
-    baseline_losses_np = load_baseline_losses(output_dir, num_samples)
+    baseline_losses_np = try_load_collect_baseline(output_dir, eval_task_instruction, num_samples)
+    reuse_collect_baseline = baseline_losses_np is not None
 
     steering = MultiLayerSteeringHooks(
         llm_layers,
@@ -560,18 +609,25 @@ def steered_inference(
         preserve_norm=args.preserve_norm,
     )
 
+    recomputed_baseline_losses: List[float] = []
     steered_losses: List[float] = []
     steered_preds: List[np.ndarray] = []
 
-    print(
-        f"Running steered inference (coeff={args.coeff}) on {num_samples} cached samples of "
-        f"'{task_instruction}' using baseline losses from collect..."
-    )
+    if reuse_collect_baseline:
+        print(
+            f"Running steered inference (coeff={args.coeff}) on {num_samples} cached eval samples of "
+            f"'{eval_task_instruction}' using collect baselines from the same task..."
+        )
+    else:
+        print(
+            f"Running steered inference (coeff={args.coeff}) on {num_samples} cached eval samples of "
+            f"'{eval_task_instruction}' with an in-loop baseline recomputation because the vector task differs..."
+        )
 
     try:
         with torch.inference_mode():
             for sample in tqdm(
-                iter_cached_subset(output_dir, task_instruction, num_samples),
+                iter_cached_subset(output_dir, eval_task_instruction, num_samples),
                 total=num_samples,
                 desc="steered pass",
             ):
@@ -595,6 +651,12 @@ def steered_inference(
                 )
                 gt_t = unnormalize_bounds_tensor(sample["actions"], action_stats).to(torch.float32)
 
+                if not reuse_collect_baseline:
+                    steering.set_num_prompt_tokens(None)
+                    baseline_pred, _ = vla.predict_action(**predict_kwargs)
+                    baseline_t = torch.tensor(baseline_pred, dtype=torch.float32).unsqueeze(0)
+                    recomputed_baseline_losses.append(float(torch.abs(baseline_t - gt_t).mean().item()))
+
                 steering.set_num_prompt_tokens(n_prompt)
                 steered_pred, _ = vla.predict_action(**predict_kwargs)
                 steering.set_num_prompt_tokens(None)
@@ -605,6 +667,8 @@ def steered_inference(
     finally:
         steering.remove()
 
+    if not reuse_collect_baseline:
+        baseline_losses_np = np.asarray(recomputed_baseline_losses, dtype=np.float32)
     steered_losses_np = np.array(steered_losses)
     deltas = steered_losses_np - baseline_losses_np
 
@@ -617,12 +681,14 @@ def steered_inference(
             writer.writerow([idx, baseline_losses_np[idx], steered_losses_np[idx], deltas[idx]])
 
     summary = {
-        "task_instruction": task_instruction,
+        "vector_task_instruction": vector_task_instruction,
+        "eval_task_instruction": eval_task_instruction,
         "dataset_name": args.dataset_name,
         "model": args.pretrained_checkpoint,
         "coeff": args.coeff,
         "preserve_norm": args.preserve_norm,
         "num_samples": len(steered_losses_np),
+        "baseline_source": "collect" if reuse_collect_baseline else "recomputed_eval_task",
         "baseline_avg_loss": float(baseline_losses_np.mean()),
         "steered_avg_loss": float(steered_losses_np.mean()),
         "avg_loss_delta": float(deltas.mean()),
@@ -639,6 +705,7 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     cfg = make_cfg(args)
+    vector_task_instruction, eval_task_instruction = resolve_task_instructions(args)
 
     run_prepare = args.phase in ("all", "prepare", "collect", "steer")
     run_collect = args.phase in ("all", "collect")
@@ -649,32 +716,51 @@ def main() -> None:
     needs_vla = run_prepare or run_collect or run_steer
     needs_action_modules = run_collect or run_steer
 
-    subset_meta = None
+    vector_subset_meta = None
+    eval_subset_meta = None
     if needs_vla:
         vla = get_vla(cfg)
         processor = get_processor(cfg)
 
     if run_prepare:
         print("=" * 60)
-        print("Phase 0: Prepare cached task subset")
+        print("Phase 0: Prepare cached task subsets")
         print("=" * 60)
-        subset_meta = prepare_task_subset(vla, processor, args, output_dir)
+        vector_subset_meta = prepare_task_subset(
+            vla, processor, args, output_dir, target_instruction=vector_task_instruction, label="vector"
+        )
+        if eval_task_instruction is None:
+            eval_subset_meta = prepare_task_subset(
+                vla,
+                processor,
+                args,
+                output_dir,
+                target_instruction=None,
+                label="eval",
+                exclude_instruction=vector_subset_meta["task_instruction"],
+            )
+            eval_task_instruction = eval_subset_meta["task_instruction"]
+        if eval_subset_meta is None and eval_task_instruction == vector_subset_meta["task_instruction"]:
+            eval_subset_meta = vector_subset_meta
+        elif eval_subset_meta is None:
+            eval_subset_meta = prepare_task_subset(
+                vla, processor, args, output_dir, target_instruction=eval_task_instruction, label="eval"
+            )
 
     if needs_action_modules:
         action_head = get_action_head(cfg, llm_dim=vla.llm_dim)
         proprio_projector = get_proprio_projector(cfg, llm_dim=vla.llm_dim, proprio_dim=PROPRIO_DIM)
 
     if run_collect:
-        if subset_meta is None:
-            target_instruction = canonicalize_instruction(args.task_instruction)
-            if target_instruction is None:
-                raise RuntimeError("Collect phase requires a cached subset; rerun with --phase prepare or --phase all.")
-            subset_meta = load_subset_metadata(get_subset_dir(output_dir, target_instruction))
+        if vector_subset_meta is None:
+            if vector_task_instruction is None:
+                raise RuntimeError("Collect phase requires a vector task instruction or a prepared vector subset.")
+            vector_subset_meta = load_subset_metadata(get_subset_dir(output_dir, vector_task_instruction))
 
         print("=" * 60)
         print("Phase 1: Collect residual streams from cached task samples")
         print("=" * 60)
-        collect_same_task_samples(vla, action_head, proprio_projector, cfg, args, output_dir, subset_meta)
+        collect_same_task_samples(vla, action_head, proprio_projector, cfg, args, output_dir, vector_subset_meta)
 
     if run_vectors:
         print("=" * 60)
@@ -689,16 +775,24 @@ def main() -> None:
         compute_spearman_from_disk(output_dir)
 
     if run_steer:
-        if subset_meta is None:
-            target_instruction = canonicalize_instruction(args.task_instruction)
-            if target_instruction is None:
-                raise RuntimeError("Steer phase requires a cached subset; rerun with --phase prepare or --phase all.")
-            subset_meta = load_subset_metadata(get_subset_dir(output_dir, target_instruction))
+        if eval_subset_meta is None:
+            if eval_task_instruction is None:
+                raise RuntimeError("Steer phase requires an eval task instruction or a prepared eval subset.")
+            eval_subset_meta = load_subset_metadata(get_subset_dir(output_dir, eval_task_instruction))
 
         print("=" * 60)
         print("Phase 4: Steered inference")
         print("=" * 60)
-        steered_inference(vla, action_head, proprio_projector, cfg, args, output_dir, subset_meta)
+        steered_inference(
+            vla,
+            action_head,
+            proprio_projector,
+            cfg,
+            args,
+            output_dir,
+            eval_subset_meta,
+            vector_task_instruction=vector_subset_meta["task_instruction"] if vector_subset_meta is not None else (vector_task_instruction or eval_task_instruction),
+        )
 
 
 if __name__ == "__main__":
